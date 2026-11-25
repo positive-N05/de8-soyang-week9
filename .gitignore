@@ -5,3 +5,5 @@ __pycache__/
 venv/
 .env
 *.pem
+# 캡처(계정 번호·IP 포함)는 공개 레포에 올리지 않고 제출 ZIP에만 포함
+capture/
