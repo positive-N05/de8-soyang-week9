@@ -1,11 +1,17 @@
-# Q4 충전 세션 Spark Structured Streaming
-# Kafka ev-charging-sessions -> Bronze/Silver(S3, foreachBatch) + 설치구역별 누적 세션 수(콘솔)
+# Q4/Q5 충전 세션 Spark Structured Streaming
+# Q4: Kafka ev-charging-sessions -> Bronze/Silver(S3, foreachBatch) + 설치구역별 누적 세션 수(콘솔)
+# Q5: 포트 점유 이상(idleSec > 5400) 세션을 Slack 으로 알리고, 설치구역별 이상 건수를 Gold 로 적재
 # 실행 (EC2 호스트, 레포 루트에서):
-#   docker exec spark-master /opt/spark/bin/spark-submit \
+#   docker exec --env-file ~/.de9_slack.env spark-master /opt/spark/bin/spark-submit \
 #     --master spark://spark-master:7077 --driver-memory 768m --executor-memory 1g \
 #     --conf spark.driver.host=spark-master --conf spark.driver.bindAddress=0.0.0.0 --conf spark.jars.ivy=/tmp/.ivy2 \
 #     --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.4,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
 #     /opt/de9/part1-ev/charger_stream.py 2> ~/q4_stream.log
+import json
+import os
+import time
+import urllib.request
+
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType, StructField, StructType
@@ -15,7 +21,10 @@ TOPIC = "ev-charging-sessions"
 BUCKET = "s3a://de9-yso-datalake"
 BRONZE_PATH = f"{BUCKET}/bronze/ev-charging-sessions"
 SILVER_PATH = f"{BUCKET}/silver/ev-charging-sessions"
+GOLD_PATH = f"{BUCKET}/gold/ev_charging_agg"
 CHECKPOINT_DIR = "/opt/spark/work-dir/checkpoints"  # master·worker 공유 볼륨
+IDLE_LIMIT_SEC = 5400  # 완충 후 90분 넘게 자리를 차지하면 포트 점유 이상
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")  # 코드·레포에 URL을 두지 않음
 
 # S3 는 EC2 IAM Role(인스턴스 프로파일) 자격 증명으로 접근 (액세스 키 없음)
 spark = (
@@ -56,6 +65,13 @@ def to_location_group(col_name):
     return F.regexp_replace(F.col(col_name), r" #\d+$", "")
 
 
+def send_slack(text):
+    """Slack Incoming Webhook 으로 메시지 1건 전송"""
+    body = json.dumps({"text": text}).encode("utf-8")
+    req = urllib.request.Request(SLACK_WEBHOOK_URL, data=body, headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req, timeout=10).read()
+
+
 # Kafka 스트림 읽기 (트리거마다 최대 60건)
 raw = (
     spark.readStream.format("kafka")
@@ -93,8 +109,26 @@ def write_bronze_silver(batch_df, batch_id):
     )
     silver.write.mode("append").partitionBy("dt").parquet(SILVER_PATH)
 
+    # ---------- Q5 Slack: 이번 배치의 포트 점유 이상 세션 알림 ----------
+    anomalies = silver.filter(F.col("idleSec") > IDLE_LIMIT_SEC).orderBy("startTime").collect()
+    for r in anomalies:
+        send_slack(
+            f"[포트 점유 이상] {r['stationName']}"
+            f"(설치구역: {r['locationGroup']} / 시작 {r['startTime']} / idleSec={r['idleSec']})"
+        )
+        time.sleep(1)  # Slack 전송 간격
 
-# 쿼리 1: Bronze/Silver 적재
+    # ---------- Q5 Gold: 지금까지 쌓인 Silver 전체로 설치구역별 이상 건수 다시 집계 ----------
+    gold = (
+        spark.read.parquet(SILVER_PATH)
+        .filter(F.col("idleSec") > IDLE_LIMIT_SEC)
+        .groupBy("locationGroup")
+        .agg(F.count("*").alias("anomaly_count"))
+    )
+    gold.coalesce(1).write.mode("overwrite").parquet(GOLD_PATH)
+
+
+# 쿼리 1: Bronze/Silver(+Slack, Gold) 적재
 lake_query = (
     raw.writeStream.foreachBatch(write_bronze_silver)
     .option("checkpointLocation", f"{CHECKPOINT_DIR}/ev-stream")
